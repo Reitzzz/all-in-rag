@@ -26,7 +26,8 @@ class Encoder:
         with torch.no_grad():
             query_emb = self.model.encode(image=image_path, text=text)
         return query_emb.tolist()[0]
-
+    
+    #初始化Visualized BGE图片编码并插入的函数
     def encode_image(self, image_path: str) -> list[float]:
         with torch.no_grad():
             query_emb = self.model.encode(image=image_path)
@@ -64,8 +65,9 @@ def visualize_results(query_image_path: str, retrieved_images: list, img_height:
     return np.hstack([query_display_area, panoramic_image])
 
 # 3. 初始化客户端
+# 连接Milvus
 print("--> 正在初始化编码器和Milvus客户端...")
-encoder = Encoder(MODEL_NAME, MODEL_PATH)
+encoder = Encoder(MODEL_NAME, MODEL_PATH) #初始化Visualize BGE Encoder
 milvus_client = MilvusClient(uri=MILVUS_URI)
 
 # 4. 创建 Milvus Collection
@@ -74,11 +76,14 @@ if milvus_client.has_collection(COLLECTION_NAME):
     milvus_client.drop_collection(COLLECTION_NAME)
     print(f"已删除已存在的 Collection: '{COLLECTION_NAME}'")
 
+# 定义Collection Schema
+# 这里使用了第一张图片进行encode 得到向量维度
 image_list = glob(os.path.join(DATA_DIR, "dragon", "*.png"))
 if not image_list:
     raise FileNotFoundError(f"在 {DATA_DIR}/dragon/ 中未找到任何 .png 图像。")
 dim = len(encoder.encode_image(image_list[0]))
 
+# Schema定义字段
 fields = [
     # 主键字段，设置自增 (auto_id=True)
     FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
@@ -99,46 +104,47 @@ print(f"成功创建 Collection: '{COLLECTION_NAME}'")
 print("Collection 结构:")
 print(milvus_client.describe_collection(collection_name=COLLECTION_NAME))
 
-# 5. 准备并插入数据
+# 5. 遍历图片并生成向量，插入数据
 print(f"\n--> 正在向 '{COLLECTION_NAME}' 插入数据")
 data_to_insert = []
 for image_path in tqdm(image_list, desc="生成图像嵌入"):
     vector = encoder.encode_image(image_path)
     data_to_insert.append({"vector": vector, "image_path": image_path})
 
+#将图片路径和生成的图片向量都插入到Milvus中
 if data_to_insert:
     result = milvus_client.insert(collection_name=COLLECTION_NAME, data=data_to_insert)
     print(f"成功插入 {result['insert_count']} 条数据。")
 
-# 6. 创建索引
+# 6. 创建HNSW索引
 print(f"\n--> 正在为 '{COLLECTION_NAME}' 创建索引")
 index_params = milvus_client.prepare_index_params()
 index_params.add_index(
-    field_name="vector",
+    field_name="vector", #给vector向量字段建立索引
     index_type="HNSW",
-    metric_type="COSINE",
-    params={"M": 16, "efConstruction": 256}
+    metric_type="COSINE", #使用余弦相似度衡量向量之间的相似程度
+    params={"M": 16, "efConstruction": 256} # 16：控制 HNSW 图中每个节点的最大连接数 256：控制构建索引时的搜索范围
 )
 milvus_client.create_index(collection_name=COLLECTION_NAME, index_params=index_params)
 print("成功为向量字段创建 HNSW 索引。")
 print("索引详情:")
-print(milvus_client.describe_index(collection_name=COLLECTION_NAME, index_name="vector"))
+print(milvus_client.describe_index(collection_name=COLLECTION_NAME, index_name="vector")) #加载collection
 milvus_client.load_collection(collection_name=COLLECTION_NAME)
 print("已加载 Collection 到内存中。")
 
-# 7. 执行多模态检索
+# 7. 将给定的提示转换为向量，执行多模态检索
 print(f"\n--> 正在 '{COLLECTION_NAME}' 中执行检索")
 query_image_path = os.path.join(DATA_DIR, "dragon", "query.png")
 query_text = "一条龙"
-query_vector = encoder.encode_query(image_path=query_image_path, text=query_text)
+query_vector = encoder.encode_query(image_path=query_image_path, text=query_text) #提示同时包括文字prompt和图片
 
 search_results = milvus_client.search(
-    collection_name=COLLECTION_NAME,
-    data=[query_vector],
+    collection_name=COLLECTION_NAME, #在给定的COLLECTION_NAME中 即在 multimodal_demo 中搜索
+    data=[query_vector], #Milvus 的 data 通常接收一个或多个查询向量，因此这里使用列表包裹
     output_fields=["image_path"],
-    limit=5,
-    search_params={"metric_type": "COSINE", "params": {"ef": 128}}
-)[0]
+    limit=5, #表示返回最相似的前 5 条结果，也就是 Top-5 检索
+    search_params={"metric_type": "COSINE", "params": {"ef": 128}} # 128是 HNSW 搜索阶段的候选搜索范围
+)[0]  #执行Top-K检索
 
 retrieved_images = []
 print("检索结果:")
